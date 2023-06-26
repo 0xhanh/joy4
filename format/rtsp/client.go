@@ -1299,8 +1299,10 @@ func Handler(h *avutil.RegisterHandler) {
 		if !strings.HasPrefix(uri, "rtsp://") {
 			return
 		}
-		ok = true
-		demuxer, err = Dial(uri)
+		// demuxer, err = Dial(uri)
+		demuxer, err = DialTimeout(uri, 15*time.Second)
+		ok = err == nil
+
 		return
 	}
 }
