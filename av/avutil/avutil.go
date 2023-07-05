@@ -298,6 +298,9 @@ func CopyFile(dst av.Muxer, src av.Demuxer) (err error) {
 	if streams, err = src.Streams(); err != nil {
 		return
 	}
+
+	fmt.Printf(">>> Streams: %+v: \n", streams)
+
 	if err = dst.WriteHeader(streams); err != nil {
 		return
 	}

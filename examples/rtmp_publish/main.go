@@ -20,16 +20,16 @@ func init() {
 
 func main() {
 	ctx := context.Background()
-	// file, _ := avutil.Open(ctx, "/home/hanh/elcom/vms/joy4/sample.flv")
-	url := "rtsp://admin:123456@192.168.51.113:8555/stream/profile/0"
+	// url := "rtsp://admin:123456@192.168.51.113:8555/stream/profile/0"
+	url := "rtsp://admin:123456@192.168.51.110:8555/stream/profile/0"
 	file, err := avutil.Open(ctx, url)
 	if err != nil {
 		panic(err)
-		return
 	}
 
-	conn, err := rtmp.DialTimeout("rtmp://localhost:1935/app/publish", 30*time.Second)
-	// conn, _ := avutil.Create("rtmp://localhost:1936/app/publish")
+	// conn, err := rtmp.DialTimeout("rtmp://localhost:1935/app/publish", 120*time.Second)
+	conn, err := rtmp.Dial("rtmp://localhost:1935/app/publish")
+	// // conn, _ := avutil.Create("rtmp://localhost:1936/app/publish")
 
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error %v \n", err)
@@ -37,8 +37,11 @@ func main() {
 	}
 
 	demuxer := &pktque.FilterDemuxer{Demuxer: file, Filter: &pktque.Walltime{}}
+	// demuxer.Streams()
+
 	avutil.CopyFile(conn, demuxer)
 
+	fmt.Println("Wait for finish")
 	time.Sleep(100 * time.Second)
 
 	file.Close()
