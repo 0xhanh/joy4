@@ -30,5 +30,10 @@ type Stream struct {
 
 // hvd
 func (s *Stream) IsStreamAvail() bool {
-	return (s.Sdp.Config != nil) || (s.sps != nil && s.pps != nil)
+	switch s.Sdp.Type.String() {
+	case "H264":
+		return (s.Sdp.Config != nil) || (s.sps != nil && s.pps != nil)
+	default:
+		return true
+	}
 }
