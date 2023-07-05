@@ -1,13 +1,13 @@
-
 package h264parser
 
 import (
+	"bytes"
+	"fmt"
+	"time"
+
 	"github.com/kerberos-io/joy4/av"
 	"github.com/kerberos-io/joy4/utils/bits"
 	"github.com/kerberos-io/joy4/utils/bits/pio"
-	"fmt"
-	"bytes"
-	"time"
 )
 
 const (
@@ -200,8 +200,8 @@ Additionally, there is a new variable called NALULengthSizeMinusOne. This confus
 An advantage to this format is the ability to configure the decoder at the start and jump into the middle of a stream. This is a common use case where the media is available on a random access medium such as a hard drive, and is therefore used in common container formats such as MP4 and MKV.
 */
 
-var StartCodeBytes = []byte{0,0,1}
-var AUDBytes = []byte{0,0,0,1,0x9,0xf0,0,0,0,1} // AUD
+var StartCodeBytes = []byte{0, 0, 1}
+var AUDBytes = []byte{0, 0, 0, 1, 0x9, 0xf0, 0, 0, 0, 1} // AUD
 
 func CheckNALUsType(b []byte) (typ int) {
 	_, typ = SplitNALUs(b)
@@ -344,11 +344,10 @@ type SPSInfo struct {
 	FpsDen uint
 }
 
-
 func cleanupEmulationPrevention(data []byte) (dataOut []byte) {
 	dataOut = make([]byte, len(data))
 	var rdIdx, wrIdx int
- 	for ; rdIdx<len(data); rdIdx++ {
+	for ; rdIdx < len(data); rdIdx++ {
 		// Read one byte
 		dataOut[wrIdx] = data[rdIdx]
 		// Check if the next 32 bits match 0x00000300, 0x00000301, 0x00000302, 0x00000303
@@ -369,7 +368,6 @@ func cleanupEmulationPrevention(data []byte) (dataOut []byte) {
 
 func ParseSPS(data []byte) (self SPSInfo, err error) {
 	data = cleanupEmulationPrevention(data)
-
 
 	r := &bits.GolombBitReader{R: bytes.NewReader(data)}
 
@@ -674,9 +672,9 @@ func ParseSPS(data []byte) (self SPSInfo, err error) {
 }
 
 type CodecData struct {
-	Record []byte
+	Record     []byte
 	RecordInfo AVCDecoderConfRecord
-	SPSInfo SPSInfo
+	SPSInfo    SPSInfo
 }
 
 func (self CodecData) Type() av.CodecType {
@@ -737,14 +735,26 @@ func NewCodecDataFromAVCDecoderConfRecord(record []byte) (self CodecData, err er
 	return
 }
 
+//
+/**
+* hvd
+* fix: SDP malformed: sprop-parameter-sets=
+* https://github.com/kerberos-io/agent/issues/105
+ */
 func NewCodecDataFromSPSAndPPS(sps, pps []byte) (self CodecData, err error) {
 	recordinfo := AVCDecoderConfRecord{}
-	recordinfo.AVCProfileIndication = sps[1]
-	recordinfo.ProfileCompatibility = sps[2]
-	recordinfo.AVCLevelIndication = sps[3]
-	recordinfo.SPS = [][]byte{sps}
-	recordinfo.PPS = [][]byte{pps}
-	recordinfo.LengthSizeMinusOne = 3
+	if len(sps) > 0 {
+		recordinfo.AVCProfileIndication = sps[1]
+		recordinfo.ProfileCompatibility = sps[2]
+		recordinfo.AVCLevelIndication = sps[3]
+		recordinfo.SPS = [][]byte{sps}
+
+	}
+	if len(pps) > 0 {
+		recordinfo.PPS = [][]byte{pps}
+	}
+
+	recordinfo.LengthSizeMinusOne = 3 // check...
 
 	buf := make([]byte, recordinfo.Len())
 	recordinfo.Marshal(buf)
@@ -755,6 +765,9 @@ func NewCodecDataFromSPSAndPPS(sps, pps []byte) (self CodecData, err error) {
 	if self.SPSInfo, err = ParseSPS(sps); err != nil {
 		return
 	}
+
+	// fmt.Printf("RecordInfo: %+v", self.RecordInfo)
+	// fmt.Printf("SPSInfo: %+v", self.SPSInfo)
 	return
 }
 
@@ -778,8 +791,8 @@ func (self *AVCDecoderConfRecord) Unmarshal(b []byte) (n int, err error) {
 	self.AVCProfileIndication = b[1]
 	self.ProfileCompatibility = b[2]
 	self.AVCLevelIndication = b[3]
-	self.LengthSizeMinusOne = b[4]&0x03
-	spscount := int(b[5]&0x1f)
+	self.LengthSizeMinusOne = b[4] & 0x03
+	spscount := int(b[5] & 0x1f)
 	n += 6
 
 	for i := 0; i < spscount; i++ {
@@ -827,10 +840,10 @@ func (self *AVCDecoderConfRecord) Unmarshal(b []byte) (n int, err error) {
 func (self AVCDecoderConfRecord) Len() (n int) {
 	n = 7
 	for _, sps := range self.SPS {
-		n += 2+len(sps)
+		n += 2 + len(sps)
 	}
 	for _, pps := range self.PPS {
-		n += 2+len(pps)
+		n += 2 + len(pps)
 	}
 	return
 }
@@ -840,8 +853,8 @@ func (self AVCDecoderConfRecord) Marshal(b []byte) (n int) {
 	b[1] = self.AVCProfileIndication
 	b[2] = self.ProfileCompatibility
 	b[3] = self.AVCLevelIndication
-	b[4] = self.LengthSizeMinusOne|0xfc
-	b[5] = uint8(len(self.SPS))|0xe0
+	b[4] = self.LengthSizeMinusOne | 0xfc
+	b[5] = uint8(len(self.SPS)) | 0xe0
 	n += 6
 
 	for _, sps := range self.SPS {
@@ -879,7 +892,7 @@ func (self SliceType) String() string {
 }
 
 const (
-	SLICE_P = iota+1
+	SLICE_P = iota + 1
 	SLICE_B
 	SLICE_I
 )
@@ -891,9 +904,9 @@ func ParseSliceHeaderFromNALU(packet []byte) (sliceType SliceType, err error) {
 		return
 	}
 
-	nal_unit_type := packet[0]&0x1f
+	nal_unit_type := packet[0] & 0x1f
 	switch nal_unit_type {
-	case 1,2,5,19:
+	case 1, 2, 5, 19:
 		// slice_layer_without_partitioning_rbsp
 		// slice_data_partition_a_layer_rbsp
 
@@ -916,11 +929,11 @@ func ParseSliceHeaderFromNALU(packet []byte) (sliceType SliceType, err error) {
 	}
 
 	switch u {
-	case 0,3,5,8:
+	case 0, 3, 5, 8:
 		sliceType = SLICE_P
-	case 1,6:
+	case 1, 6:
 		sliceType = SLICE_B
-	case 2,4,7,9:
+	case 2, 4, 7, 9:
 		sliceType = SLICE_I
 	default:
 		err = fmt.Errorf("h264parser: slice_type=%d invalid", u)

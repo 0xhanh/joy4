@@ -135,9 +135,21 @@ func (self *Client) allCodecDataReady() bool {
 	return true
 }
 
+// hvd
+func (self *Client) allSPSAndPPSAlready() bool {
+	for _, si := range self.setupIdx {
+		stream := self.streams[si]
+		if stream.sps == nil || stream.pps == nil {
+			return false
+		}
+	}
+
+	return true
+}
+
 func (self *Client) probe() (err error) {
 	for {
-		if self.allCodecDataReady() {
+		if self.allCodecDataReady() && self.allSPSAndPPSAlready() {
 			break
 		}
 		if _, err = self.readPacket(); err != nil {
@@ -801,15 +813,28 @@ func (self *Stream) makeCodecData() (err error) {
 				}
 			}
 
-			if len(self.sps) > 0 && len(self.pps) > 0 {
+			// hvd
+			if len(self.sps) > 0 || len(self.pps) > 0 {
 				if self.CodecData, err = h264parser.NewCodecDataFromSPSAndPPS(self.sps, self.pps); err != nil {
 					err = fmt.Errorf("rtsp: h264 sps/pps invalid: %s", err)
 					return
 				}
 			} else {
-				err = fmt.Errorf("rtsp: missing h264 sps or pps")
+				// err = fmt.Errorf("rtsp: missing h264 sps or pps")
+				fmt.Println("rtsp: missing h264 sps or pps")
+				fmt.Println("should be edited to get SPS and PPS from the H264 NALUs")
 				return
 			}
+
+			// if len(self.sps) > 0 && len(self.pps) > 0 {
+			// 	if self.CodecData, err = h264parser.NewCodecDataFromSPSAndPPS(self.sps, self.pps); err != nil {
+			// 		err = fmt.Errorf("rtsp: h264 sps/pps invalid: %s", err)
+			// 		return
+			// 	}
+			// } else {
+			// 	err = fmt.Errorf("rtsp: missing h264 sps or pps")
+			// 	return
+			// }
 
 		case av.AAC:
 			if len(media.Config) == 0 {
