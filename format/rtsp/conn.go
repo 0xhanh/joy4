@@ -5,21 +5,21 @@ import (
 	"time"
 )
 
-type connWithTimeout struct {
+type ConnWithTimeout struct {
 	Timeout time.Duration
 	net.Conn
 }
 
-func (self connWithTimeout) Read(p []byte) (n int, err error) {
-	if self.Timeout > 0 {
-		self.Conn.SetReadDeadline(time.Now().Add(self.Timeout))
+func (c *ConnWithTimeout) Read(p []byte) (n int, err error) {
+	if c.Timeout > 0 {
+		c.Conn.SetReadDeadline(time.Now().Add(c.Timeout))
 	}
-	return self.Conn.Read(p)
+	return c.Conn.Read(p)
 }
 
-func (self connWithTimeout) Write(p []byte) (n int, err error) {
-	if self.Timeout > 0 {
-		self.Conn.SetWriteDeadline(time.Now().Add(self.Timeout))
+func (c *ConnWithTimeout) Write(p []byte) (n int, err error) {
+	if c.Timeout > 0 {
+		c.Conn.SetWriteDeadline(time.Now().Add(c.Timeout))
 	}
-	return self.Conn.Write(p)
+	return c.Conn.Write(p)
 }

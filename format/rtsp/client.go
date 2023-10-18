@@ -16,6 +16,7 @@ import (
 	"github.com/kerberos-io/joy4/codec/aacparser"
 	"github.com/kerberos-io/joy4/codec/h264parser"
 	"github.com/kerberos-io/joy4/format/rtsp/sdp"
+
 	"github.com/kerberos-io/joy4/utils/bits/pio"
 
 	"log"
@@ -29,12 +30,21 @@ import (
 
 var ErrCodecDataChange = fmt.Errorf("rtsp: codec data change, please call HandleCodecDataChange()")
 
+const userAgentName = "User-Agent: ElcVMSLib v" + MEDIA_CLIENT_VERSION
+
 var DebugRtp = false
-var DebugRtsp = false
+var DebugRtsp = true
 var SkipErrRtpBlock = false
 
+const RTSP_TIMEOUT_DEFAULT = 15 * time.Second
+const RTP_TIMEOUT_DEFAULT = 15 * time.Second
+
 const (
-	stageOptionsDone = iota + 1
+	stageHttpBegin = iota
+	stageGetDone
+	stagePostDone
+	stageRtspBegin
+	stageOptionsDone
 	stageDescribeDone
 	stageSetupDone
 	stageWaitCodecData
@@ -50,9 +60,10 @@ type Client struct {
 
 	RtspTimeout          time.Duration
 	RtpTimeout           time.Duration
+	DialTimeout          time.Duration
 	RtpKeepAliveTimeout  time.Duration
 	rtpKeepaliveTimer    time.Time
-	rtpKeepaliveEnterCnt int
+	rtpKeepaliveEnterCnt uint
 
 	stage int
 
@@ -61,21 +72,32 @@ type Client struct {
 
 	authHeaders func(method string) []string
 
-	url         *url.URL
-	conn        *connWithTimeout
-	brconn      *bufio.Reader
-	requestUri  string
-	cseq        uint
-	streams     []*Stream
-	streamsintf []av.CodecData
-	session     string
-	body        io.Reader
+	url                *url.URL
+	dataConn           *ConnWithTimeout
+	controlConn        *ConnWithTimeout
+	brconn             *bufio.Reader
+	requestUri         string
+	cseq               uint64
+	streams            []*Stream
+	streamsintf        []av.CodecData
+	session            string
+	sessionCookie      string // use for tunnel http
+	body               io.Reader
+	tunnelOverHttpPort uint
+	optionParam        *OptionParam // setting or option
+}
+
+type OptionParam struct {
+	tunnelPort int
+	audioOff   bool
+	// add-on params
 }
 
 type Request struct {
-	Header []string
-	Uri    string
-	Method string
+	Header   []string
+	Uri      string
+	Method   string
+	Protocol string
 }
 
 type Response struct {
@@ -87,14 +109,16 @@ type Response struct {
 	Block []byte
 }
 
-func DialTimeout(uri string, timeout time.Duration) (self *Client, err error) {
+func Dial(uri string, timeout time.Duration, tunnelPort uint) (self *Client, err error) {
 	var URL *url.URL
 	if URL, err = url.Parse(uri); err != nil {
 		return
 	}
 
 	if _, _, err := net.SplitHostPort(URL.Host); err != nil {
-		URL.Host = URL.Host + ":554"
+		if tunnelPort > 0 {
+			URL.Host = URL.Host + ":" + strconv.FormatUint(uint64(tunnelPort), 10)
+		}
 	}
 
 	dailer := net.Dialer{Timeout: timeout}
@@ -106,28 +130,49 @@ func DialTimeout(uri string, timeout time.Duration) (self *Client, err error) {
 	u2 := *URL
 	u2.User = nil
 
-	connt := &connWithTimeout{Conn: conn}
+	connt := &ConnWithTimeout{Conn: conn}
 
 	self = &Client{
-		conn:                connt,
+		dataConn:            connt,
 		brconn:              bufio.NewReaderSize(connt, 256),
 		url:                 URL,
 		requestUri:          u2.String(),
 		DebugRtp:            DebugRtp,
 		DebugRtsp:           DebugRtsp,
+		stage:               stageRtspBegin,
 		SkipErrRtpBlock:     SkipErrRtpBlock,
 		RtpKeepAliveTimeout: 10 * time.Second,
+		RtspTimeout:         RTSP_TIMEOUT_DEFAULT,
+		RtpTimeout:          RTP_TIMEOUT_DEFAULT,
+		DialTimeout:         timeout,
+		tunnelOverHttpPort:  tunnelPort,
 	}
+
+	if tunnelPort > 0 {
+		self.stage = stageHttpBegin
+		log.Println("Rtsp Client will run in the RTSP-over-HTTP tunneling, tunnel port:", tunnelPort)
+	}
+
 	return
 }
 
-func Dial(uri string) (self *Client, err error) {
-	return DialTimeout(uri, time.Second*5)
+func (c *Client) SetOptionParam(opParam *OptionParam) {
+	c.optionParam = opParam
 }
 
-func (self *Client) allCodecDataReady() bool {
-	for _, si := range self.setupIdx {
-		stream := self.streams[si]
+func (c *Client) OpenConnection() (connt *ConnWithTimeout, err error) {
+	dailer := net.Dialer{Timeout: c.DialTimeout}
+	var conn net.Conn
+	if conn, err = dailer.Dial("tcp", c.url.Host); err != nil {
+		return
+	}
+
+	return &ConnWithTimeout{Conn: conn, Timeout: c.RtspTimeout}, nil
+}
+
+func (c *Client) allCodecDataReady() bool {
+	for _, si := range c.setupIdx {
+		stream := c.streams[si]
 		if stream.CodecData == nil {
 			return false
 		}
@@ -135,11 +180,10 @@ func (self *Client) allCodecDataReady() bool {
 	return true
 }
 
-// hvd
-func (self *Client) allSPSAndPPSAlready() bool {
-	for _, si := range self.setupIdx {
-		stream := self.streams[si]
-		if stream.sps == nil || stream.pps == nil {
+func (c *Client) spsAndPpsReady() bool {
+	for _, si := range c.setupIdx {
+		stream := c.streams[si]
+		if !stream.IsSpsAndPpsReady() {
 			return false
 		}
 	}
@@ -147,42 +191,147 @@ func (self *Client) allSPSAndPPSAlready() bool {
 	return true
 }
 
-func (self *Client) probe() (err error) {
+func (c *Client) probe() (err error) {
 	for {
-		if self.allCodecDataReady() && self.allSPSAndPPSAlready() {
+		if c.allCodecDataReady() && c.spsAndPpsReady() {
 			break
 		}
-		if _, err = self.readPacket(); err != nil {
+		if _, err = c.readPacket(); err != nil {
 			return
 		}
 	}
-	self.stage = stageCodecDataDone
+	c.stage = stageCodecDataDone
 	return
 }
 
-func (self *Client) prepare(stage int) (err error) {
-	for self.stage < stage {
-		switch self.stage {
-		case 0:
-			if err = self.Options(); err != nil {
+func (c *Client) GET() (err error) {
+	if c.sessionCookie == "" {
+		c.sessionCookie = genSessionCookie()
+	}
+
+	// expected: GET /profile/media.smp HTTP/1.0
+	req := Request{
+		Method:   "GET",
+		Uri:      c.url.Path, // path: /profile/media.smp
+		Protocol: "HTTP/1.0",
+		Header: []string{
+			userAgentName,
+			"x-sessioncookie: " + c.sessionCookie,
+			// "Accept: application/sdp",
+			"Accept: application/x-rtsp-tunnelled",
+			"Pragma: no-cache",
+			"Cache-Control: no-cache",
+		},
+	}
+
+	if err = c.WriteRequest(req); err != nil {
+		return
+	}
+
+	var res Response
+	if res, err = c.ReadResponse(false); err != nil {
+		return
+	}
+
+	// Note: If a HTTP "GET" command (for RTSP-over-HTTP tunneling) returns "401 Unauthorized", then we resend it
+	// (with an "Authorization:" header), just as we would for a RTSP command.  However, we do so using a new TCP connection,
+	// because some servers close the original connection after returning the "401 Unauthorized".
+	//// brconn:              bufio.NewReaderSize(connt, 256),
+	if res.StatusCode == 401 {
+		c.ResetClient() // forces the opening of a new connection for the resent command
+		var dataConn *ConnWithTimeout
+		if dataConn, err = c.OpenConnection(); err != nil {
+			return
+		}
+
+		// new connection
+		c.dataConn = dataConn
+		c.brconn = bufio.NewReaderSize(dataConn, 256)
+
+		return
+	}
+
+	c.stage = stageGetDone
+	return
+}
+
+func (c *Client) POST() (err error) {
+	if c.stage < stageGetDone || c.sessionCookie == "" {
+		log.Println("POST: session has not inited, GET firstly")
+		return
+	}
+
+	controlConn, err := c.OpenConnection()
+	if err != nil {
+		// can not open connection for command sock
+		log.Println("POST: Can not open a connection for command sock")
+		return
+	}
+
+	c.controlConn = controlConn
+
+	// expected: POST /profile/media.smp HTTP/1.0
+	req := Request{
+		Method:   "POST",
+		Uri:      c.url.Path, // path: /profile/media.smp
+		Protocol: "HTTP/1.0",
+		Header: []string{
+			userAgentName,
+			"x-sessioncookie: " + c.sessionCookie,
+			"Content-Type: application/x-rtsp-tunnelled",
+			"Accept: application/x-rtsp-tunnelled",
+			"Pragma: no-cache",
+			"Cache-Control: no-cache",
+			"Content-Length: 32767",
+			"Expires: Sun, 9 Jan 1972 00:00:00 GMT",
+		},
+	}
+
+	if err = c.WriteRequest(req); err != nil {
+		return
+	}
+
+	// There is no reponse from the server! The client will continue to send RTSP as
+	// the message body of this POST request. T
+	// if _, err = c.ReadResponse(true); err != nil {
+	// 	return
+	// }
+
+	c.stage = stagePostDone
+	return
+}
+
+func (c *Client) prepare(stage int) (err error) {
+	for c.stage < stage {
+		switch c.stage {
+		case stageHttpBegin:
+			if err = c.GET(); err != nil {
+				return
+			}
+		case stageGetDone:
+			if err = c.POST(); err != nil {
+				return
+			}
+		case stagePostDone, stageRtspBegin:
+			if err = c.Options(); err != nil {
 				return
 			}
 		case stageOptionsDone:
-			if _, err = self.Describe(); err != nil {
+			if _, err = c.Describe(); err != nil {
 				return
 			}
 		case stageDescribeDone:
-			if err = self.SetupAll(); err != nil {
+			if err = c.SetupAll(); err != nil {
 				return
 			}
 
 		case stageSetupDone:
-			if err = self.Play(); err != nil {
+			if err = c.Play(); err != nil {
 				return
 			}
 
 		case stageWaitCodecData:
-			if err = self.probe(); err != nil {
+			if err = c.probe(); err != nil {
 				return
 			}
 		}
@@ -190,57 +339,72 @@ func (self *Client) prepare(stage int) (err error) {
 	return
 }
 
-func (self *Client) Streams() (streams []av.CodecData, err error) {
-	if err = self.prepare(stageCodecDataDone); err != nil {
+func (c *Client) Streams() (streams []av.CodecData, err error) {
+	if err = c.prepare(stageCodecDataDone); err != nil {
 		return
 	}
-	for _, si := range self.setupIdx {
-		stream := self.streams[si]
+	for _, si := range c.setupIdx {
+		stream := c.streams[si]
 		streams = append(streams, stream.CodecData)
 	}
 	return
 }
 
-func (self *Client) SendRtpKeepalive() (err error) {
-	if self.RtpKeepAliveTimeout > 0 {
-		if self.rtpKeepaliveTimer.IsZero() {
-			self.rtpKeepaliveTimer = time.Now()
-		} else if time.Now().Sub(self.rtpKeepaliveTimer) > self.RtpKeepAliveTimeout {
-			self.rtpKeepaliveTimer = time.Now()
-			if self.DebugRtsp {
-				fmt.Println("rtp: keep alive")
+func (c *Client) SendRtpKeepalive() (err error) {
+	if c.RtpKeepAliveTimeout > 0 {
+		if c.rtpKeepaliveTimer.IsZero() {
+			c.rtpKeepaliveTimer = time.Now()
+		} else if time.Since(c.rtpKeepaliveTimer) > c.RtpKeepAliveTimeout {
+			c.rtpKeepaliveTimer = time.Now()
+			if c.DebugRtsp {
+				log.Println("rtp: keep alive")
 			}
 			req := Request{
 				Method: "OPTIONS",
-				Uri:    self.requestUri,
+				// Method:   "GET_PARAMETER",
+				Uri:      c.requestUri,
+				Protocol: "RTSP/1.0",
 				Header: []string{
-					"User-Agent: Kerberos.io",
-					//"Accept: application/sdp",
+					userAgentName,
+					"Accept: application/sdp",
 					//"Require: www.onvif.org/ver20/backchannel",
 				},
 			}
-			if self.session != "" {
-				req.Header = append(req.Header, "Session: "+self.session)
+			if c.session != "" {
+				req.Header = append(req.Header, "Session: "+c.session)
 			}
-			if err = self.WriteRequest(req); err != nil {
+			if err = c.WriteRequest(req); err != nil {
 				return
 			}
+			// for test
+			// if _, err = c.ReadResponse(true); err != nil {
+			// 	return
+			// }
 		}
 	}
 	return
 }
 
-func (self *Client) WriteRequest(req Request) (err error) {
-	self.conn.Timeout = self.RtspTimeout
-	self.cseq++
+func (c *Client) WriteRequest(req Request) (err error) {
+	c.cseq++
 
 	buf := &bytes.Buffer{}
 
-	fmt.Fprintf(buf, "%s %s RTSP/1.0\r\n", req.Method, req.Uri)
-	fmt.Fprintf(buf, "CSeq: %d\r\n", self.cseq)
+	var conn *ConnWithTimeout
+	// see: https://www.happytimesoft.com/knowledge/rtsp-over-http.html
+	if c.tunnelOverHttpPort == 0 || req.Method == "GET" {
+		conn = c.dataConn
+	} else {
+		conn = c.controlConn
+	}
 
-	if self.authHeaders != nil {
-		headers := self.authHeaders(req.Method)
+	conn.Timeout = c.RtspTimeout
+
+	fmt.Fprintf(buf, "%s %s %s\r\n", req.Method, req.Uri, req.Protocol)
+	fmt.Fprintf(buf, "CSeq: %d\r\n", c.cseq)
+
+	if c.authHeaders != nil {
+		headers := c.authHeaders(req.Method)
 		for _, s := range headers {
 			io.WriteString(buf, s)
 			io.WriteString(buf, "\r\n")
@@ -250,29 +414,42 @@ func (self *Client) WriteRequest(req Request) (err error) {
 		io.WriteString(buf, s)
 		io.WriteString(buf, "\r\n")
 	}
-	for _, s := range self.Headers {
+	for _, s := range c.Headers {
 		io.WriteString(buf, s)
 		io.WriteString(buf, "\r\n")
 	}
 	io.WriteString(buf, "\r\n")
 
-	bufout := buf.Bytes()
-
-	if self.DebugRtsp {
-		fmt.Print("> ", string(bufout))
+	if c.DebugRtsp {
+		log.Println(">> ", buf.String())
 	}
 
-	if _, err = self.conn.Write(bufout); err != nil {
+	var bufout []byte
+	// When we're tunneling RTSP-over-HTTP, we Base-64-encode the request before we send it.
+	// (However, we don't do this for the HTTP "GET" and "POST" commands that we use to set up the tunnel.)
+	if c.tunnelOverHttpPort > 0 && req.Method != "GET" && req.Method != "POST" {
+		encodedStr := base64.StdEncoding.EncodeToString(buf.Bytes())
+		bufout = []byte(encodedStr)
+
+		if c.DebugRtsp {
+			log.Println(">> ReqBase64:", encodedStr)
+		}
+
+	} else {
+		bufout = buf.Bytes()
+	}
+
+	if _, err = conn.Write(bufout); err != nil {
 		return
 	}
 
 	return
 }
 
-func (self *Client) parseBlockHeader(h []byte) (length int, no int, valid bool) {
+func (c *Client) parseBlockHeader(h []byte) (length int, no int, valid bool) {
 	length = int(h[2])<<8 + int(h[3])
 	no = int(h[1])
-	if no/2 >= len(self.streams) {
+	if no/2 >= len(c.streams) {
 		return
 	}
 
@@ -286,7 +463,7 @@ func (self *Client) parseBlockHeader(h []byte) (length int, no int, valid bool) 
 			return
 		}
 
-		stream := self.streams[no/2]
+		stream := c.streams[no/2]
 		if int(h[5]&0x7f) != stream.Sdp.PayloadType {
 			return
 		}
@@ -301,13 +478,14 @@ func (self *Client) parseBlockHeader(h []byte) (length int, no int, valid bool) 
 			}
 		}
 	} else { // rtcp
+		//
 	}
 
 	valid = true
 	return
 }
 
-func (self *Client) parseHeaders(b []byte) (statusCode int, headers textproto.MIMEHeader, err error) {
+func (c *Client) parseHeaders(b []byte) (statusCode int, headers textproto.MIMEHeader, err error) {
 	var line string
 	r := textproto.NewReader(bufio.NewReader(bytes.NewReader(b)))
 	if line, err = r.ReadLine(); err != nil {
@@ -326,51 +504,62 @@ func (self *Client) parseHeaders(b []byte) (statusCode int, headers textproto.MI
 	return
 }
 
-func (self *Client) handleResp(res *Response) (err error) {
-	if sess := res.Headers.Get("Session"); sess != "" && self.session == "" {
-		if fields := strings.Split(sess, ";"); len(fields) > 0 {
-			self.session = fields[0]
+func (c *Client) handleResp(res *Response) (err error) {
+	if sess := res.Headers.Get("Session"); sess != "" && c.session == "" {
+		fields := strings.Split(sess, ";") // [42130;timeout=60]
+		if len(fields) > 0 {
+			c.session = fields[0]
+		}
+		if len(fields) > 1 {
+			fields := strings.Split(fields[1], "=") //timeout=60
+			if len(fields) > 1 {
+				if timeout, e := strconv.Atoi(fields[1]); e == nil {
+					c.RtpTimeout = time.Duration(timeout) * time.Second
+					c.RtpKeepAliveTimeout = time.Duration(int((timeout*70)/100)) * time.Second
+				}
+			}
 		}
 	}
+
 	if res.StatusCode == 302 {
-		if err = self.handle302(res); err != nil {
+		if err = c.handle302(res); err != nil {
 			return
 		}
 	}
 	if res.StatusCode == 401 {
-		if err = self.handle401(res); err != nil {
+		if err = c.handle401(res); err != nil {
 			return
 		}
 	}
 	return
 }
 
-func (self *Client) handle302(res *Response) (err error) {
+func (c *Client) handle302(res *Response) (err error) {
 	/*
 		RTSP/1.0 200 OK
 		CSeq: 302
 	*/
 	newLocation := res.Headers.Get("Location")
-	fmt.Printf("\tRedirecting stream to other location: %s\n", newLocation)
+	log.Println("Redirecting stream to other location: ", newLocation)
 
-	err = self.Close()
+	err = c.Close()
 	if err != nil {
 		return err
 	}
 
-	newConnect, err := Dial(newLocation)
+	newConnect, err := Dial(newLocation, 5*time.Second, c.tunnelOverHttpPort)
 	if err != nil {
 		return err
 	}
 
-	self.requestUri = newLocation
-	self.conn = newConnect.conn
-	self.brconn = newConnect.brconn
+	c.requestUri = newLocation
+	c.dataConn = newConnect.dataConn
+	c.brconn = newConnect.brconn
 
 	return err
 }
 
-func (self *Client) handle401(res *Response) (err error) {
+func (c *Client) handle401(res *Response) (err error) {
 	/*
 		RTSP/1.0 401 Unauthorized
 		CSeq: 2
@@ -400,14 +589,14 @@ func (self *Client) handle401(res *Response) (err error) {
 			var username string
 			var password string
 
-			if self.url.User == nil {
+			if c.url.User == nil {
 				err = fmt.Errorf("rtsp: no username")
 				return
 			}
-			username = self.url.User.Username()
-			password, _ = self.url.User.Password()
+			username = c.url.User.Username()
+			password, _ = c.url.User.Password()
 
-			self.authHeaders = func(method string) []string {
+			c.authHeaders = func(method string) []string {
 				var headers []string
 				if nonce == "" {
 					headers = []string{
@@ -415,11 +604,11 @@ func (self *Client) handle401(res *Response) (err error) {
 					}
 				} else {
 					hs1 := md5hash(username + ":" + realm + ":" + password)
-					hs2 := md5hash(method + ":" + self.requestUri)
+					hs2 := md5hash(method + ":" + c.requestUri)
 					response := md5hash(hs1 + ":" + nonce + ":" + hs2)
 					headers = []string{fmt.Sprintf(
 						`Authorization: Digest username="%s", realm="%s", nonce="%s", uri="%s", response="%s"`,
-						username, realm, nonce, self.requestUri, response)}
+						username, realm, nonce, c.requestUri, response)}
 				}
 				return headers
 			}
@@ -429,247 +618,121 @@ func (self *Client) handle401(res *Response) (err error) {
 	return
 }
 
-func (self *Client) findRTSP() (block []byte, data []byte, err error) {
-	const (
-		R = iota + 1
-		T
-		S
-		Header
-		Dollar
-	)
-	var _peek [8]byte
-	peek := _peek[0:0]
-	stat := 0
-
-	for i := 0; ; i++ {
-		var b byte
-		if b, err = self.brconn.ReadByte(); err != nil {
-			return
-		}
-		switch b {
-		case 'R':
-			if stat == 0 {
-				stat = R
-			}
-		case 'T':
-			if stat == R {
-				stat = T
-			}
-		case 'S':
-			if stat == T {
-				stat = S
-			}
-		case 'P':
-			if stat == S {
-				stat = Header
-			}
-		case '$':
-			if stat != Dollar {
-				stat = Dollar
-				peek = _peek[0:0]
-			}
-		default:
-			if stat != Dollar {
-				stat = 0
-				peek = _peek[0:0]
-			}
-		}
-
-		if false && self.DebugRtp {
-			fmt.Println("rtsp: findRTSP", i, b)
-		}
-
-		if stat != 0 {
-			peek = append(peek, b)
-		}
-		if stat == Header {
-			data = peek
-			return
-		}
-
-		if stat == Dollar && len(peek) >= 12 {
-			if self.DebugRtp {
-				fmt.Println("rtsp: dollar at", i, len(peek))
-			}
-			if blocklen, _, ok := self.parseBlockHeader(peek); ok {
-				left := blocklen + 4 - len(peek)
-				if left >= 0 {
-					block = append(peek, make([]byte, left)...)
-					if _, err = io.ReadFull(self.brconn, block[len(peek):]); err != nil {
-						return
-					}
-					return
-				} else {
-					fmt.Println("Left < 0 ", blocklen, len(peek), left)
-				}
-			}
-			stat = 0
-			peek = _peek[0:0]
-		}
-	}
-
-	return
-}
-
-func (self *Client) readLFLF() (block []byte, data []byte, err error) {
-	const (
-		LF = iota + 1
-		LFLF
-	)
-	peek := []byte{}
-	stat := 0
-	dollarpos := -1
-	lpos := 0
-	pos := 0
-
-	for {
-		var b byte
-		if b, err = self.brconn.ReadByte(); err != nil {
-			return
-		}
-		switch b {
-		case '\n':
-			if stat == 0 {
-				stat = LF
-				lpos = pos
-			} else if stat == LF {
-				if pos-lpos <= 2 {
-					stat = LFLF
-				} else {
-					lpos = pos
-				}
-			}
-		case '$':
-			dollarpos = pos
-		}
-		peek = append(peek, b)
-
-		if stat == LFLF {
-			data = peek
-			return
-		} else if dollarpos != -1 && dollarpos-pos >= 12 {
-			hdrlen := dollarpos - pos
-			start := len(peek) - hdrlen
-			if blocklen, _, ok := self.parseBlockHeader(peek[start:]); ok {
-				block = append(peek[start:], make([]byte, blocklen+4-hdrlen)...)
-				if _, err = io.ReadFull(self.brconn, block[hdrlen:]); err != nil {
-					return
-				}
-				return
-			}
-			dollarpos = -1
-		}
-
-		pos++
-	}
-
-	return
-}
-
-func (self *Client) readResp(b []byte) (res Response, err error) {
-	if res.StatusCode, res.Headers, err = self.parseHeaders(b); err != nil {
+func (c *Client) readResp(b []byte) (res Response, err error) {
+	if res.StatusCode, res.Headers, err = c.parseHeaders(b); err != nil {
 		return
 	}
 	res.ContentLength, _ = strconv.Atoi(res.Headers.Get("Content-Length"))
 	if res.ContentLength > 0 {
 		res.Body = make([]byte, res.ContentLength)
-		if _, err = io.ReadFull(self.brconn, res.Body); err != nil {
+		if _, err = io.ReadFull(c.brconn, res.Body); err != nil {
 			return
 		}
 	}
-	if err = self.handleResp(&res); err != nil {
+	if err = c.handleResp(&res); err != nil {
 		return
 	}
 	return
 }
 
-func (self *Client) poll() (res Response, err error) {
+func (c *Client) poll(forRtsp bool) (res Response, err error) {
 	var block []byte
 	var rtsp []byte
 	var headers []byte
 
-	self.conn.Timeout = self.RtspTimeout
+	c.dataConn.Timeout = c.RtspTimeout
 	for {
-		if block, rtsp, err = self.findRTSP(); err != nil {
+		if forRtsp {
+			block, rtsp, err = findRTSP(c)
+		} else {
+			block, rtsp, err = findHTTP(c)
+		}
+		if err != nil {
 			return
 		}
+
 		if len(block) > 0 {
 			res.Block = block
 			return
 		} else {
-			if block, headers, err = self.readLFLF(); err != nil {
+			if block, headers, err = readLFLF(c); err != nil {
 				return
 			}
 			if len(block) > 0 {
 				res.Block = block
 				return
 			}
-			if res, err = self.readResp(append(rtsp, headers...)); err != nil {
+			if res, err = c.readResp(append(rtsp, headers...)); err != nil {
 				return
 			}
 		}
 		return
 	}
-
-	return
 }
 
-func (self *Client) ReadResponse() (res Response, err error) {
+func (c *Client) ReadResponse(forRtsp bool) (res Response, err error) {
 	for {
-		if res, err = self.poll(); err != nil {
+		if res, err = c.poll(forRtsp); err != nil {
 			return
 		}
-		if res.StatusCode > 0 {
+		if DebugRtsp {
+			log.Println(">> Response: ", res)
+		}
+		if res.StatusCode > 0 { // TODO: 490 Account Blocked
+
 			return
 		}
 	}
-	return
 }
 
-func (self *Client) SetupAll() (err error) {
+func (c *Client) SetupAll() (err error) {
 	idx := []int{}
-	for i := range self.streams {
+	for i := range c.streams {
 		idx = append(idx, i)
 	}
-	return self.Setup(idx)
+	return c.Setup(idx)
 }
 
-func (self *Client) Setup(idx []int) (err error) {
-	if err = self.prepare(stageDescribeDone); err != nil {
+func (c *Client) Setup(idx []int) (err error) {
+	if err = c.prepare(stageDescribeDone); err != nil {
 		return
 	}
 
-	self.setupMap = make([]int, len(self.streams))
-	for i := range self.setupMap {
-		self.setupMap[i] = -1
+	c.setupMap = make([]int, len(c.streams))
+	for i := range c.setupMap {
+		c.setupMap[i] = -1
 	}
-	self.setupIdx = idx
+	c.setupIdx = idx
 
 	for i, si := range idx {
-		self.setupMap[si] = i
+		c.setupMap[si] = i
 
 		uri := ""
-		control := self.streams[si].Sdp.Control
+		control := c.streams[si].Sdp.Control
 		if strings.HasPrefix(control, "rtsp://") {
 			uri = control
 		} else {
-			uri = self.requestUri + "/" + control
+			uri = c.requestUri + "/" + control
 		}
-		req := Request{Method: "SETUP", Uri: uri}
+		req := Request{
+			Method:   "SETUP",
+			Uri:      uri,
+			Protocol: "RTSP/1.0",
+		}
 		req.Header = append(req.Header, fmt.Sprintf("Transport: RTP/AVP/TCP;unicast;interleaved=%d-%d", si*2, si*2+1))
-		if self.session != "" {
-			req.Header = append(req.Header, "Session: "+self.session)
+		if c.session != "" {
+			req.Header = append(req.Header, "Session: "+c.session)
 		}
-		if err = self.WriteRequest(req); err != nil {
+		if err = c.WriteRequest(req); err != nil {
 			return
 		}
-		if _, err = self.ReadResponse(); err != nil {
+		if _, err = c.ReadResponse(true); err != nil {
 			return
 		}
 	}
 
-	if self.stage == stageDescribeDone {
-		self.stage = stageSetupDone
+	if c.stage == stageDescribeDone {
+		c.stage = stageSetupDone
 	}
 	return
 }
@@ -679,81 +742,102 @@ func md5hash(s string) string {
 	return hex.EncodeToString(h[:])
 }
 
-func (self *Client) Describe() (streams []sdp.Media, err error) {
+func (c *Client) Describe() (streams []sdp.Media, err error) {
 	var res Response
 
 	for i := 0; i < 2; i++ {
 		req := Request{
-			Method: "DESCRIBE",
-			Uri:    self.requestUri,
+			Method:   "DESCRIBE",
+			Uri:      c.requestUri,
+			Protocol: "RTSP/1.0",
 			Header: []string{
-				"User-Agent: Kerberos.io",
+				userAgentName,
 				"Accept: application/sdp",
 				//"Require: www.onvif.org/ver20/backchannel",
 			},
 		}
-		if err = self.WriteRequest(req); err != nil {
+		if err = c.WriteRequest(req); err != nil {
 			return
 		}
-		if res, err = self.ReadResponse(); err != nil {
+		if res, err = c.ReadResponse(true); err != nil {
 			return
 		}
-		if res.StatusCode == 200 {
+
+		if res.StatusCode == 200 { // 490 -> try 2
 			break
+		} else if res.StatusCode == 401 { //
+			// retry
+		} else {
+			// any reason, for example 490 Account Block on Axis Cam
+			// Just relax a moment and one more retry here
+			log.Println("rtsp: DESCRIBE StatusCode:", res.StatusCode)
+			log.Println("rtsp: Just relax a moment and one more retry")
+			time.Sleep(20 * time.Second)
+			// In case of account block or rate-limit, Camera can close the connecion/session
+			// Should make an another conn/session??
 		}
 	}
-	if res.ContentLength == 0 {
+
+	// 490 Account Block??
+	if res.ContentLength == 0 || res.StatusCode != 200 {
 		err = fmt.Errorf("rtsp: Describe failed, StatusCode=%d", res.StatusCode)
 		return
 	}
 
 	body := string(res.Body)
 
-	if self.DebugRtsp {
-		fmt.Println("<", body)
+	if c.DebugRtsp {
+		log.Println("<", body)
 	}
 
 	_, medias := sdp.Parse(body)
 
-	self.streams = []*Stream{}
+	c.streams = []*Stream{}
 	for _, media := range medias {
-		stream := &Stream{Sdp: media, client: self}
+		// audio off
+		if c.optionParam.audioOff && media.AVType == "audio" {
+			continue
+		}
+
+		stream := &Stream{Sdp: media, client: c}
 		err = stream.makeCodecData()
 		if err == nil {
-			self.streams = append(self.streams, stream)
+			c.streams = append(c.streams, stream)
 			streams = append(streams, media)
 		} else {
 			log.Print("Error: ", err.Error())
 		}
 	}
-	self.stage = stageDescribeDone
+
+	c.stage = stageDescribeDone
 	return
 }
 
-func (self *Client) Options() (err error) {
+func (c *Client) Options() (err error) {
 	req := Request{
-		Method: "OPTIONS",
-		Uri:    self.requestUri,
+		Method:   "OPTIONS",
+		Uri:      c.requestUri,
+		Protocol: "RTSP/1.0",
 	}
-	if self.session != "" {
-		req.Header = append(req.Header, "Session: "+self.session)
+	if c.session != "" {
+		req.Header = append(req.Header, "Session: "+c.session)
 	}
-	if err = self.WriteRequest(req); err != nil {
+	if err = c.WriteRequest(req); err != nil {
 		return
 	}
-	if _, err = self.ReadResponse(); err != nil {
+	if _, err = c.ReadResponse(true); err != nil {
 		return
 	}
-	self.stage = stageOptionsDone
+	c.stage = stageOptionsDone
 	return
 }
 
-func (self *Client) HandleCodecDataChange() (_newcli *Client, err error) {
+func (c *Client) HandleCodecDataChange() (_newcli *Client, err error) {
 	newcli := &Client{}
-	*newcli = *self
+	*newcli = *c
 
 	newcli.streams = []*Stream{}
-	for _, stream := range self.streams {
+	for _, stream := range c.streams {
 		newstream := &Stream{}
 		*newstream = *stream
 		newstream.client = newcli
@@ -771,20 +855,20 @@ func (self *Client) HandleCodecDataChange() (_newcli *Client, err error) {
 	return
 }
 
-func (self *Stream) clearCodecDataChange() {
-	self.spsChanged = false
-	self.ppsChanged = false
+func (c *Stream) clearCodecDataChange() {
+	c.spsChanged = false
+	c.ppsChanged = false
 }
 
-func (self *Stream) isCodecDataChange() bool {
-	if self.spsChanged && self.ppsChanged {
+func (c *Stream) isCodecDataChange() bool {
+	if c.spsChanged && c.ppsChanged {
 		return true
 	}
 	return false
 }
 
-func (self *Stream) timeScale() int {
-	t := self.Sdp.TimeScale
+func (c *Stream) timeScale() int {
+	t := c.Sdp.TimeScale
 	if t == 0 {
 		// https://tools.ietf.org/html/rfc5391
 		t = 8000
@@ -792,63 +876,53 @@ func (self *Stream) timeScale() int {
 	return t
 }
 
-func (self *Stream) makeCodecData() (err error) {
-	media := self.Sdp
-	if media.PayloadType >= 96 && media.PayloadType <= 127 {
+func (c *Stream) makeCodecData() (err error) {
+	media := c.Sdp
+	if (media.PayloadType >= 96 && media.PayloadType <= 127) || media.PayloadType == 35 {
 		switch media.Type {
 		case av.H264:
 			for _, nalu := range media.SpropParameterSets {
 				if len(nalu) > 0 {
-					self.handleH264Payload(0, nalu)
+					c.handleH264Payload(0, nalu)
 				}
 			}
 
-			if len(self.sps) == 0 || len(self.pps) == 0 {
+			if len(c.sps) == 0 || len(c.pps) == 0 {
 				if nalus, typ := h264parser.SplitNALUs(media.Config); typ != h264parser.NALU_RAW {
 					for _, nalu := range nalus {
 						if len(nalu) > 0 {
-							self.handleH264Payload(0, nalu)
+							c.handleH264Payload(0, nalu)
 						}
 					}
 				}
 			}
 
 			// hvd
-			if len(self.sps) > 0 || len(self.pps) > 0 {
-				if self.CodecData, err = h264parser.NewCodecDataFromSPSAndPPS(self.sps, self.pps); err != nil {
+			if len(c.sps) > 0 || len(c.pps) > 0 {
+				if c.CodecData, err = h264parser.NewCodecDataFromSPSAndPPS(c.sps, c.pps); err != nil {
 					err = fmt.Errorf("rtsp: h264 sps/pps invalid: %s", err)
 					return
 				}
 			} else {
 				// err = fmt.Errorf("rtsp: missing h264 sps or pps")
-				fmt.Println("rtsp: missing h264 sps or pps")
-				fmt.Println("should be edited to get SPS and PPS from the H264 NALUs")
+				log.Println("rtsp: missing h264 sps or pps")
+				log.Println("should be edited to get SPS and PPS from the H264 NALUs")
 				return
 			}
-
-			// if len(self.sps) > 0 && len(self.pps) > 0 {
-			// 	if self.CodecData, err = h264parser.NewCodecDataFromSPSAndPPS(self.sps, self.pps); err != nil {
-			// 		err = fmt.Errorf("rtsp: h264 sps/pps invalid: %s", err)
-			// 		return
-			// 	}
-			// } else {
-			// 	err = fmt.Errorf("rtsp: missing h264 sps or pps")
-			// 	return
-			// }
 
 		case av.AAC:
 			if len(media.Config) == 0 {
 				err = fmt.Errorf("rtsp: aac sdp config missing")
 				return
 			}
-			if self.CodecData, err = aacparser.NewCodecDataFromMPEG4AudioConfigBytes(media.Config); err != nil {
+			if c.CodecData, err = aacparser.NewCodecDataFromMPEG4AudioConfigBytes(media.Config); err != nil {
 				err = fmt.Errorf("rtsp: aac sdp config invalid: %s", err)
 				return
 			}
 		case av.OPUS:
 
 			// TODO!
-			self.CodecData = codec.NewPCMMulawCodecData()
+			c.CodecData = codec.NewPCMMulawCodecData()
 
 			//channelLayout := av.CH_MONO
 			//if media.ChannelCount == 2 {
@@ -864,10 +938,10 @@ func (self *Stream) makeCodecData() (err error) {
 	} else {
 		switch media.PayloadType {
 		case 0:
-			self.CodecData = codec.NewPCMMulawCodecData()
+			c.CodecData = codec.NewPCMMulawCodecData()
 
 		case 8:
-			self.CodecData = codec.NewPCMAlawCodecData()
+			c.CodecData = codec.NewPCMAlawCodecData()
 
 		default:
 			err = fmt.Errorf("rtsp: PayloadType=%d unsupported", media.PayloadType)
@@ -877,13 +951,13 @@ func (self *Stream) makeCodecData() (err error) {
 	return
 }
 
-func (self *Stream) handleBuggyAnnexbH264Packet(timestamp uint32, packet []byte) (isBuggy bool, err error) {
+func (c *Stream) handleBuggyAnnexbH264Packet(timestamp uint32, packet []byte) (isBuggy bool, err error) {
 	if len(packet) >= 4 && packet[0] == 0 && packet[1] == 0 && packet[2] == 0 && packet[3] == 1 {
 		isBuggy = true
 		if nalus, typ := h264parser.SplitNALUs(packet); typ != h264parser.NALU_RAW {
 			for _, nalu := range nalus {
 				if len(nalu) > 0 {
-					if err = self.handleH264Payload(timestamp, nalu); err != nil {
+					if err = c.handleH264Payload(timestamp, nalu); err != nil {
 						return
 					}
 				}
@@ -893,14 +967,14 @@ func (self *Stream) handleBuggyAnnexbH264Packet(timestamp uint32, packet []byte)
 	return
 }
 
-func (self *Stream) handleH264Payload(timestamp uint32, packet []byte) (err error) {
+func (c *Stream) handleH264Payload(timestamp uint32, packet []byte) (err error) {
 	if len(packet) < 2 {
 		err = fmt.Errorf("rtp: h264 packet too short")
 		return
 	}
 
 	var isBuggy bool
-	if isBuggy, err = self.handleBuggyAnnexbH264Packet(timestamp, packet); isBuggy {
+	if isBuggy, err = c.handleBuggyAnnexbH264Packet(timestamp, packet); isBuggy {
 		return
 	}
 
@@ -925,43 +999,43 @@ func (self *Stream) handleH264Payload(timestamp uint32, packet []byte) (err erro
 	switch {
 	case naluType >= 1 && naluType <= 5:
 		if naluType == 5 {
-			self.pkt.IsKeyFrame = true
+			c.pkt.IsKeyFrame = true
 		}
-		self.gotpkt = true
+		c.gotpkt = true
 		// raw nalu to avcc
 		b := make([]byte, 4+len(packet))
 		pio.PutU32BE(b[0:4], uint32(len(packet)))
 		copy(b[4:], packet)
-		self.pkt.Data = b
-		self.timestamp = timestamp
+		c.pkt.Data = b
+		c.timestamp = timestamp
 
 	case naluType == 7: // sps
-		if self.client != nil && self.client.DebugRtp {
-			fmt.Println("rtsp: got sps")
+		if c.client != nil && c.client.DebugRtp {
+			log.Println("rtsp: got sps")
 		}
-		if len(self.sps) == 0 {
-			self.sps = packet
-			self.makeCodecData()
-		} else if bytes.Compare(self.sps, packet) != 0 {
-			self.spsChanged = true
-			self.sps = packet
-			if self.client != nil && self.client.DebugRtp {
-				fmt.Println("rtsp: sps changed")
+		if len(c.sps) == 0 {
+			c.sps = packet
+			c.makeCodecData()
+		} else if bytes.Compare(c.sps, packet) != 0 {
+			c.spsChanged = true
+			c.sps = packet
+			if c.client != nil && c.client.DebugRtp {
+				log.Println("rtsp: sps changed")
 			}
 		}
 
 	case naluType == 8: // pps
-		if self.client != nil && self.client.DebugRtp {
-			fmt.Println("rtsp: got pps")
+		if c.client != nil && c.client.DebugRtp {
+			log.Println("rtsp: got pps")
 		}
-		if len(self.pps) == 0 {
-			self.pps = packet
-			self.makeCodecData()
-		} else if bytes.Compare(self.pps, packet) != 0 {
-			self.ppsChanged = true
-			self.pps = packet
-			if self.client != nil && self.client.DebugRtp {
-				fmt.Println("rtsp: pps changed")
+		if len(c.pps) == 0 {
+			c.pps = packet
+			c.makeCodecData()
+		} else if bytes.Compare(c.pps, packet) != 0 {
+			c.ppsChanged = true
+			c.pps = packet
+			if c.client != nil && c.client.DebugRtp {
+				log.Println("rtsp: pps changed")
 			}
 		}
 
@@ -1019,14 +1093,14 @@ func (self *Stream) handleH264Payload(timestamp uint32, packet []byte) (err erro
 		isStart := fuHeader&0x80 != 0
 		isEnd := fuHeader&0x40 != 0
 		if isStart {
-			self.fuStarted = true
-			self.fuBuffer = []byte{fuIndicator&0xe0 | fuHeader&0x1f}
+			c.fuStarted = true
+			c.fuBuffer = []byte{fuIndicator&0xe0 | fuHeader&0x1f}
 		}
-		if self.fuStarted {
-			self.fuBuffer = append(self.fuBuffer, packet[2:]...)
+		if c.fuStarted {
+			c.fuBuffer = append(c.fuBuffer, packet[2:]...)
 			if isEnd {
-				self.fuStarted = false
-				if err = self.handleH264Payload(timestamp, self.fuBuffer); err != nil {
+				c.fuStarted = false
+				if err = c.handleH264Payload(timestamp, c.fuBuffer); err != nil {
 					return
 				}
 			}
@@ -1061,7 +1135,7 @@ func (self *Stream) handleH264Payload(timestamp uint32, packet []byte) (err erro
 			if size+2 > len(packet) {
 				break
 			}
-			if err = self.handleH264Payload(timestamp, packet[2:size+2]); err != nil {
+			if err = c.handleH264Payload(timestamp, packet[2:size+2]); err != nil {
 				return
 			}
 			packet = packet[size+2:]
@@ -1082,19 +1156,19 @@ func (self *Stream) handleH264Payload(timestamp uint32, packet []byte) (err erro
 	return
 }
 
-func (self *Stream) handleRtpPacket(packet []byte) (err error) {
-	if self.isCodecDataChange() {
+func (c *Stream) handleRtpPacket(packet []byte) (err error) {
+	if c.isCodecDataChange() {
 		err = ErrCodecDataChange
 		return
 	}
 
-	if self.client != nil && self.client.DebugRtp {
-		fmt.Println("rtp: packet", self.CodecData.Type(), "len", len(packet))
+	if c.client != nil && c.client.DebugRtp {
+		log.Println("rtp: packet", c.CodecData.Type(), "len", len(packet))
 		dumpsize := len(packet)
 		if dumpsize > 32 {
 			dumpsize = 32
 		}
-		fmt.Print(hex.Dump(packet[:dumpsize]))
+		log.Print(hex.Dump(packet[:dumpsize]))
 	}
 
 	/*
@@ -1167,9 +1241,9 @@ func (self *Stream) handleRtpPacket(packet []byte) (err error) {
 	*/
 	//payloadType := packet[1]&0x7f
 
-	switch self.Sdp.Type {
+	switch c.Sdp.Type {
 	case av.H264:
-		if err = self.handleH264Payload(timestamp, payload); err != nil {
+		if err = c.handleH264Payload(timestamp, payload); err != nil {
 			return
 		}
 
@@ -1179,71 +1253,100 @@ func (self *Stream) handleRtpPacket(packet []byte) (err error) {
 			return
 		}
 		payload = payload[4:] // TODO: remove this hack
-		self.gotpkt = true
-		self.pkt.Data = payload
-		self.timestamp = timestamp
+		c.gotpkt = true
+		c.pkt.Data = payload
+		c.timestamp = timestamp
 
 	default:
-		self.gotpkt = true
-		self.pkt.Data = payload
-		self.timestamp = timestamp
+		c.gotpkt = true
+		c.pkt.Data = payload
+		c.timestamp = timestamp
 	}
 
 	return
 }
 
-func (self *Client) Play() (err error) {
+func (c *Client) Play() (err error) {
 	req := Request{
-		Method: "PLAY",
-		Uri:    self.requestUri,
+		Method:   "PLAY",
+		Uri:      c.requestUri,
+		Protocol: "RTSP/1.0",
 	}
-	req.Header = append(req.Header, "Session: "+self.session)
-	if err = self.WriteRequest(req); err != nil {
+	req.Header = append(req.Header, "Session: "+c.session)
+	if err = c.WriteRequest(req); err != nil {
 		return
 	}
-	if self.allCodecDataReady() {
-		self.stage = stageCodecDataDone
+	if c.allCodecDataReady() {
+		c.stage = stageCodecDataDone
 	} else {
-		self.stage = stageWaitCodecData
+		c.stage = stageWaitCodecData
 	}
 	return
 }
 
-func (self *Client) Teardown() (err error) {
+func (c *Client) Teardown() (err error) {
 	req := Request{
-		Method: "TEARDOWN",
-		Uri:    self.requestUri,
+		Method:   "TEARDOWN",
+		Uri:      c.requestUri,
+		Protocol: "RTSP/1.0",
 	}
-	req.Header = append(req.Header, "Session: "+self.session)
-	if err = self.WriteRequest(req); err != nil {
+	req.Header = append(req.Header, "Session: "+c.session)
+	if err = c.WriteRequest(req); err != nil {
 		return
 	}
 	return
 }
 
-func (self *Client) Close() (err error) {
-	return self.conn.Conn.Close()
+func (c *Client) Close() (err error) {
+	if c.dataConn != nil {
+		err = c.dataConn.Close()
+	}
+	if c.controlConn != nil {
+		err = c.controlConn.Close()
+	}
+
+	return
 }
 
-func (self *Client) handleBlock(block []byte) (pkt av.Packet, ok bool, err error) {
-	_, blockno, _ := self.parseBlockHeader(block)
+func (c *Client) ResetClient() {
+	if c.dataConn != nil {
+		c.dataConn.Close()
+	}
+	if c.controlConn != nil {
+		c.controlConn.Close()
+	}
+
+	if c.tunnelOverHttpPort > 0 {
+		c.stage = stageHttpBegin
+	} else {
+		c.stage = stageRtspBegin
+	}
+
+	c.brconn = nil
+	c.session = ""
+	c.sessionCookie = ""
+	c.cseq = 0
+}
+
+func (c *Client) handleBlock(block []byte) (pkt av.Packet, ok bool, err error) {
+	_, blockno, _ := c.parseBlockHeader(block)
 	if blockno%2 != 0 {
-		if self.DebugRtp {
-			fmt.Println("rtsp: rtcp block len", len(block)-4)
+		if c.DebugRtp {
+			log.Println("rtsp: rtcp block len", len(block)-4)
 		}
 		return
 	}
 
 	i := blockno / 2
-	if i >= len(self.streams) {
+	if i >= len(c.streams) {
 		err = fmt.Errorf("rtsp: block no=%d invalid", blockno)
 		return
 	}
-	stream := self.streams[i]
+	stream := c.streams[i]
 
 	herr := stream.handleRtpPacket(block[4:])
 	if herr != nil {
-		if !self.SkipErrRtpBlock {
+		if !c.SkipErrRtpBlock {
 			err = herr
 			return
 		}
@@ -1265,7 +1368,7 @@ func (self *Client) handleBlock(block []byte) (pkt av.Packet, ok bool, err error
 		ok = true
 		pkt = stream.pkt
 		pkt.Time = time.Duration(stream.timestamp) * time.Second / time.Duration(stream.timeScale())
-		pkt.Idx = int8(self.setupMap[i])
+		pkt.Idx = int8(c.setupMap[i])
 
 		if pkt.Time < stream.lasttime || pkt.Time-stream.lasttime > time.Minute*30 {
 			err = fmt.Errorf("rtp: time invalid stream#%d time=%v lasttime=%v", pkt.Idx, pkt.Time, stream.lasttime)
@@ -1273,8 +1376,8 @@ func (self *Client) handleBlock(block []byte) (pkt av.Packet, ok bool, err error
 		}
 		stream.lasttime = pkt.Time
 
-		if self.DebugRtp {
-			fmt.Println("rtp: pktout", pkt.Idx, pkt.Time, len(pkt.Data))
+		if c.DebugRtp {
+			log.Println("rtp: pktout", pkt.Idx, pkt.Time, len(pkt.Data))
 		}
 
 		stream.pkt = av.Packet{}
@@ -1284,15 +1387,15 @@ func (self *Client) handleBlock(block []byte) (pkt av.Packet, ok bool, err error
 	return
 }
 
-func (self *Client) readPacket() (pkt av.Packet, err error) {
-	if err = self.SendRtpKeepalive(); err != nil {
+func (c *Client) readPacket() (pkt av.Packet, err error) {
+	if err = c.SendRtpKeepalive(); err != nil {
 		return
 	}
 
 	for {
 		var res Response
 		for {
-			if res, err = self.poll(); err != nil {
+			if res, err = c.poll(false); err != nil {
 				return
 			}
 			if len(res.Block) > 0 {
@@ -1301,7 +1404,7 @@ func (self *Client) readPacket() (pkt av.Packet, err error) {
 		}
 
 		var ok bool
-		if pkt, ok, err = self.handleBlock(res.Block); err != nil {
+		if pkt, ok, err = c.handleBlock(res.Block); err != nil {
 			return
 		}
 		if ok {
@@ -1312,22 +1415,84 @@ func (self *Client) readPacket() (pkt av.Packet, err error) {
 	return
 }
 
-func (self *Client) ReadPacket() (pkt av.Packet, err error) {
-	if err = self.prepare(stageCodecDataDone); err != nil {
+func (c *Client) ReadPacket() (pkt av.Packet, err error) {
+	if err = c.prepare(stageCodecDataDone); err != nil {
 		return
 	}
-	return self.readPacket()
+	return c.readPacket()
 }
 
 func Handler(h *avutil.RegisterHandler) {
 	h.UrlDemuxer = func(uri string) (ok bool, demuxer av.DemuxCloser, err error) {
-		if !strings.HasPrefix(uri, "rtsp://") {
+		URL, err := url.Parse(uri)
+		if err != nil {
+			log.Println("Error parsing URI: ", uri)
 			return
 		}
-		// demuxer, err = Dial(uri)
-		demuxer, err = DialTimeout(uri, 15*time.Second)
-		ok = err == nil
 
+		// Check if the URL Scheme is valid
+		if URL.Scheme != "rtsp" && URL.Scheme != "rtsp+http" {
+			return
+		}
+
+		// Extract the tunnelPort from query parameters
+		opParams := parseOptionParam(URL)
+		if opParams.tunnelPort == 0 && URL.Scheme == "rtsp+http" {
+			opParams.tunnelPort = getPort(URL, 80)
+		}
+		URL.Scheme = "rtsp"
+
+		// Modify the URL with updated query parameters
+		// URL.RawQuery = removeQueryKey(URL.RawQuery, "tunnelPort")
+
+		client, err := Dial(URL.String(), 15*time.Second, uint(opParams.tunnelPort))
+		if err == nil {
+			client.SetOptionParam(&opParams)
+		}
+
+		return err == nil, client, err
+	}
+}
+
+func parseOptionParam(URL *url.URL) (op OptionParam) {
+	op = OptionParam{}
+
+	queryParams, err := url.ParseQuery(URL.RawQuery)
+	if err != nil {
+		log.Println("Error parsing query parameters:", err)
 		return
 	}
+
+	// tunnel port
+	if tunnelPortStr := queryParams.Get("tunnelPort"); tunnelPortStr != "" {
+		if tunnel, err := strconv.ParseInt(tunnelPortStr, 10, 0); err == nil {
+			op.tunnelPort = int(tunnel)
+		}
+	}
+	if audioOff := strings.TrimSpace(queryParams.Get("audioOff")); audioOff == "1" {
+		op.audioOff = true
+	}
+
+	// Modify the URL with updated query parameters
+	URL.RawQuery = removeQueryKey(URL.RawQuery, "tunnelPort")
+	URL.RawQuery = removeQueryKey(URL.RawQuery, "audioOff")
+
+	// add-on params..
+
+	return
+}
+
+func getPort(URL *url.URL, defaultPort int) int {
+	if URL.Port() != "" {
+		if port, err := strconv.ParseInt(URL.Port(), 10, 0); err == nil {
+			return int(port)
+		}
+	}
+	return defaultPort
+}
+
+func removeQueryKey(rawQuery string, key string) string {
+	queryParams, _ := url.ParseQuery(rawQuery)
+	delete(queryParams, key)
+	return queryParams.Encode()
 }

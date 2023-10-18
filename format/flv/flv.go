@@ -3,7 +3,8 @@ package flv
 import (
 	"bufio"
 	"fmt"
-	"github.com/kerberos-io/joy4/utils/bits/pio"
+	"io"
+
 	"github.com/kerberos-io/joy4/av"
 	"github.com/kerberos-io/joy4/av/avutil"
 	"github.com/kerberos-io/joy4/codec"
@@ -11,7 +12,7 @@ import (
 	"github.com/kerberos-io/joy4/codec/fake"
 	"github.com/kerberos-io/joy4/codec/h264parser"
 	"github.com/kerberos-io/joy4/format/flv/flvio"
-	"io"
+	"github.com/kerberos-io/joy4/utils/bits/pio"
 )
 
 var MaxProbePacketCount = 20

@@ -28,7 +28,6 @@ type Stream struct {
 	lasttime time.Duration
 }
 
-// hvd
 func (s *Stream) IsStreamAvail() bool {
 	switch s.Sdp.Type.String() {
 	case "H264":
@@ -36,4 +35,11 @@ func (s *Stream) IsStreamAvail() bool {
 	default:
 		return true
 	}
+}
+
+func (s *Stream) IsSpsAndPpsReady() bool {
+	if s.sps == nil || s.pps == nil {
+		return false
+	}
+	return true
 }
