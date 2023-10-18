@@ -18,8 +18,8 @@ type HandlerDemuxer struct {
 	r io.ReadCloser
 }
 
-func (self *HandlerDemuxer) Close() error {
-	return self.r.Close()
+func (h *HandlerDemuxer) Close() error {
+	return h.r.Close()
 }
 
 type HandlerMuxer struct {
@@ -28,31 +28,31 @@ type HandlerMuxer struct {
 	stage int
 }
 
-func (self *HandlerMuxer) WriteHeader(streams []av.CodecData) (err error) {
-	if self.stage == 0 {
-		if err = self.Muxer.WriteHeader(streams); err != nil {
+func (h *HandlerMuxer) WriteHeader(streams []av.CodecData) (err error) {
+	if h.stage == 0 {
+		if err = h.Muxer.WriteHeader(streams); err != nil {
 			return
 		}
-		self.stage++
+		h.stage++
 	}
 	return
 }
 
-func (self *HandlerMuxer) WriteTrailer() (err error) {
-	if self.stage == 1 {
-		self.stage++
-		if err = self.Muxer.WriteTrailer(); err != nil {
+func (h *HandlerMuxer) WriteTrailer() (err error) {
+	if h.stage == 1 {
+		h.stage++
+		if err = h.Muxer.WriteTrailer(); err != nil {
 			return
 		}
 	}
 	return
 }
 
-func (self *HandlerMuxer) Close() (err error) {
-	if err = self.WriteTrailer(); err != nil {
+func (h *HandlerMuxer) Close() (err error) {
+	if err = h.WriteTrailer(); err != nil {
 		return
 	}
-	return self.w.Close()
+	return h.w.Close()
 }
 
 type RegisterHandler struct {
@@ -74,15 +74,15 @@ type Handlers struct {
 	handlers []RegisterHandler
 }
 
-func (self *Handlers) Add(fn func(*RegisterHandler)) {
+func (h *Handlers) Add(fn func(*RegisterHandler)) {
 	handler := &RegisterHandler{}
 	fn(handler)
-	self.handlers = append(self.handlers, *handler)
+	h.handlers = append(h.handlers, *handler)
 }
 
-func (self *Handlers) openUrl(ctx context.Context, u *url.URL, uri string) (r io.ReadCloser, err error) {
+func (h *Handlers) openUrl(ctx context.Context, u *url.URL, uri string) (r io.ReadCloser, err error) {
 	if u != nil && u.Scheme != "" {
-		for _, handler := range self.handlers {
+		for _, handler := range h.handlers {
 			if handler.UrlReader != nil {
 				var ok bool
 				if ok, r, err = handler.UrlReader(uri); ok {
@@ -97,43 +97,43 @@ func (self *Handlers) openUrl(ctx context.Context, u *url.URL, uri string) (r io
 	return
 }
 
-func (self *Handlers) createUrl(u *url.URL, uri string) (w io.WriteCloser, err error) {
+func (h *Handlers) createUrl(u *url.URL, uri string) (w io.WriteCloser, err error) {
 	w, err = os.Create(uri)
 	return
 }
 
-func (self *Handlers) NewAudioEncoder(typ av.CodecType) (enc av.AudioEncoder, err error) {
-	for _, handler := range self.handlers {
+func (h *Handlers) NewAudioEncoder(typ av.CodecType) (enc av.AudioEncoder, err error) {
+	for _, handler := range h.handlers {
 		if handler.AudioEncoder != nil {
 			if enc, _ = handler.AudioEncoder(typ); enc != nil {
 				return
 			}
 		}
 	}
-	err = fmt.Errorf("avutil: encoder", typ, "not found")
+	err = fmt.Errorf("avutil: encoder %v not found", typ)
 	return
 }
 
-func (self *Handlers) NewAudioDecoder(codec av.AudioCodecData) (dec av.AudioDecoder, err error) {
-	for _, handler := range self.handlers {
+func (h *Handlers) NewAudioDecoder(codec av.AudioCodecData) (dec av.AudioDecoder, err error) {
+	for _, handler := range h.handlers {
 		if handler.AudioDecoder != nil {
 			if dec, _ = handler.AudioDecoder(codec); dec != nil {
 				return
 			}
 		}
 	}
-	err = fmt.Errorf("avutil: decoder", codec.Type(), "not found")
+	err = fmt.Errorf("avutil: decoder %v not found", codec.Type())
 	return
 }
 
-func (self *Handlers) Open(ctx context.Context, uri string) (demuxer av.DemuxCloser, err error) {
+func (h *Handlers) Open(ctx context.Context, uri string) (demuxer av.DemuxCloser, err error) {
 	listen := false
 	if strings.HasPrefix(uri, "listen:") {
 		uri = uri[len("listen:"):]
 		listen = true
 	}
 
-	for _, handler := range self.handlers {
+	for _, handler := range h.handlers {
 		if listen {
 			if handler.ServerDemuxer != nil {
 				var ok bool
@@ -161,10 +161,10 @@ func (self *Handlers) Open(ctx context.Context, uri string) (demuxer av.DemuxClo
 	}
 
 	if ext != "" {
-		for _, handler := range self.handlers {
+		for _, handler := range h.handlers {
 			if handler.Ext == ext {
 				if handler.ReaderDemuxer != nil {
-					if r, err = self.openUrl(ctx, u, uri); err != nil {
+					if r, err = h.openUrl(ctx, u, uri); err != nil {
 						return
 					}
 					demuxer = &HandlerDemuxer{
@@ -178,14 +178,14 @@ func (self *Handlers) Open(ctx context.Context, uri string) (demuxer av.DemuxClo
 	}
 
 	var probebuf [1024]byte
-	if r, err = self.openUrl(ctx, u, uri); err != nil {
+	if r, err = h.openUrl(ctx, u, uri); err != nil {
 		return
 	}
 	if _, err = io.ReadFull(r, probebuf[:]); err != nil {
 		return
 	}
 
-	for _, handler := range self.handlers {
+	for _, handler := range h.handlers {
 		if handler.Probe != nil && handler.Probe(probebuf[:]) && handler.ReaderDemuxer != nil {
 			var _r io.Reader
 			if rs, ok := r.(io.ReadSeeker); ok {
@@ -209,19 +209,19 @@ func (self *Handlers) Open(ctx context.Context, uri string) (demuxer av.DemuxClo
 	return
 }
 
-func (self *Handlers) Create(uri string) (muxer av.MuxCloser, err error) {
-	_, muxer, err = self.FindCreate(uri)
+func (h *Handlers) Create(uri string) (muxer av.MuxCloser, err error) {
+	_, muxer, err = h.FindCreate(uri)
 	return
 }
 
-func (self *Handlers) FindCreate(uri string) (handler RegisterHandler, muxer av.MuxCloser, err error) {
+func (h *Handlers) FindCreate(uri string) (handler RegisterHandler, muxer av.MuxCloser, err error) {
 	listen := false
 	if strings.HasPrefix(uri, "listen:") {
 		uri = uri[len("listen:"):]
 		listen = true
 	}
 
-	for _, handler = range self.handlers {
+	for _, handler = range h.handlers {
 		if listen {
 			if handler.ServerMuxer != nil {
 				var ok bool
@@ -248,10 +248,10 @@ func (self *Handlers) FindCreate(uri string) (handler RegisterHandler, muxer av.
 	}
 
 	if ext != "" {
-		for _, handler = range self.handlers {
+		for _, handler = range h.handlers {
 			if handler.Ext == ext && handler.WriterMuxer != nil {
 				var w io.WriteCloser
-				if w, err = self.createUrl(u, uri); err != nil {
+				if w, err = h.createUrl(u, uri); err != nil {
 					return
 				}
 				muxer = &HandlerMuxer{
@@ -281,14 +281,38 @@ func CopyPackets(dst av.PacketWriter, src av.PacketReader) (err error) {
 	for {
 		var pkt av.Packet
 		if pkt, err = src.ReadPacket(); err != nil {
+			// log.Println(">>> Copy: ReadPacket ", err.Error())
 			if err == io.EOF {
 				break
 			}
 			return
 		}
+		// fmt.Printf(">>> WritePacket: %+v: \n", pkt)
 		if err = dst.WritePacket(pkt); err != nil {
 			return
 		}
+	}
+	return
+}
+
+func PrepareStreams(src av.Demuxer) (streams []av.CodecData, err error) {
+	streams, err = src.Streams() // take time
+	return
+}
+
+func CopyStream(dst av.Muxer, src av.Demuxer, codecs []av.CodecData) (err error) {
+	if err = dst.WriteHeader(codecs); err != nil {
+		return
+	}
+	// fmt.Printf(">>> CopyPackets \n")
+	if err = CopyPackets(dst, src); err != nil {
+		if err != io.EOF {
+			return
+		}
+	}
+	// fmt.Printf(">>> WriteTrailer \n")
+	if err = dst.WriteTrailer(); err != nil {
+		return
 	}
 	return
 }
@@ -299,16 +323,17 @@ func CopyFile(dst av.Muxer, src av.Demuxer) (err error) {
 		return
 	}
 
-	fmt.Printf(">>> Streams: %+v: \n", streams)
-
+	// fmt.Printf(">>> Streams: %+v: \n", streams)
 	if err = dst.WriteHeader(streams); err != nil {
 		return
 	}
+	// fmt.Printf(">>> CopyPackets \n")
 	if err = CopyPackets(dst, src); err != nil {
 		if err != io.EOF {
 			return
 		}
 	}
+	// fmt.Printf(">>> WriteTrailer \n")
 	if err = dst.WriteTrailer(); err != nil {
 		return
 	}

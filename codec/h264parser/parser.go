@@ -737,7 +737,6 @@ func NewCodecDataFromAVCDecoderConfRecord(record []byte) (self CodecData, err er
 
 //
 /**
-* hvd
 * fix: SDP malformed: sprop-parameter-sets=
 * https://github.com/kerberos-io/agent/issues/105
  */

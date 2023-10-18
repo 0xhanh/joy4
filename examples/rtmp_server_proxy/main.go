@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"strings"
-	"github.com/kerberos-io/joy4/format"
+
 	"github.com/kerberos-io/joy4/av/avutil"
+	"github.com/kerberos-io/joy4/format"
 	"github.com/kerberos-io/joy4/format/rtmp"
 )
 
@@ -18,7 +20,7 @@ func main() {
 	server.HandlePlay = func(conn *rtmp.Conn) {
 		segs := strings.Split(conn.URL.Path, "/")
 		url := fmt.Sprintf("%s://%s", segs[1], strings.Join(segs[2:], "/"))
-		src, _ := avutil.Open(url)
+		src, _ := avutil.Open(context.Background(), url)
 		avutil.CopyFile(conn, src)
 	}
 

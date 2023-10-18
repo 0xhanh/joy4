@@ -760,7 +760,7 @@ func (c *Client) Describe() (streams []sdp.Media, err error) {
 			return
 		}
 
-		if res.StatusCode == 200 { // 490 -> try 2
+		if res.StatusCode == 200 {
 			break
 		} else if res.StatusCode == 401 { //
 			// retry

@@ -1,6 +1,6 @@
 package ffmpeg
 
-import "C"
+// import "C"
 import (
 	"fmt"
 	"image"

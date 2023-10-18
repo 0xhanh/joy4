@@ -1,11 +1,13 @@
 package avconv
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"time"
-	"github.com/kerberos-io/joy4/av/avutil"
+
 	"github.com/kerberos-io/joy4/av"
+	"github.com/kerberos-io/joy4/av/avutil"
 	"github.com/kerberos-io/joy4/av/pktque"
 	"github.com/kerberos-io/joy4/av/transcode"
 )
@@ -14,7 +16,7 @@ var Debug bool
 
 type Option struct {
 	Transcode bool
-	Args []string
+	Args      []string
 }
 
 type Options struct {
@@ -23,7 +25,7 @@ type Options struct {
 
 type Demuxer struct {
 	transdemux *transcode.Demuxer
-	streams []av.CodecData
+	streams    []av.CodecData
 	Options
 	Demuxer av.Demuxer
 }
@@ -56,10 +58,10 @@ func (self *Demuxer) prepare() (err error) {
 	}
 
 	/*
-	var streams []av.CodecData
-	if streams, err = self.Demuxer.Streams(); err != nil {
-		return
-	}
+		var streams []av.CodecData
+		if streams, err = self.Demuxer.Streams(); err != nil {
+			return
+		}
 	*/
 
 	supports := self.Options.OutputCodecTypes
@@ -83,7 +85,7 @@ func (self *Demuxer) prepare() (err error) {
 		ok = true
 
 		var enctype av.CodecType
-		for _, typ:= range supports {
+		for _, typ := range supports {
 			if typ.IsAudio() {
 				if enc, _ = avutil.DefaultHandlers.NewAudioEncoder(typ); enc != nil {
 					enctype = typ
@@ -152,7 +154,7 @@ func ConvertCmdline(args []string) (err error) {
 				flagt = false
 				var f float64
 				fmt.Sscanf(arg, "%f", &f)
-				duration = time.Duration(f*float64(time.Second))
+				duration = time.Duration(f * float64(time.Second))
 
 			default:
 				output = arg
@@ -173,7 +175,8 @@ func ConvertCmdline(args []string) (err error) {
 	var demuxer av.DemuxCloser
 	var muxer av.MuxCloser
 
-	if demuxer, err = avutil.Open(input); err != nil {
+	// if demuxer, err = avutil.Open( input); err != nil {
+	if demuxer, err = avutil.Open(context.Background(), input); err != nil {
 		return
 	}
 	defer demuxer.Close()
@@ -223,7 +226,7 @@ func ConvertCmdline(args []string) (err error) {
 	}
 	filterdemux := &pktque.FilterDemuxer{
 		Demuxer: convdemux,
-		Filter: filters,
+		Filter:  filters,
 	}
 
 	for {
@@ -252,4 +255,3 @@ func ConvertCmdline(args []string) (err error) {
 
 	return
 }
-
