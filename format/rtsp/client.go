@@ -236,17 +236,14 @@ func (c *Client) GET() (err error) {
 	// Note: If a HTTP "GET" command (for RTSP-over-HTTP tunneling) returns "401 Unauthorized", then we resend it
 	// (with an "Authorization:" header), just as we would for a RTSP command.  However, we do so using a new TCP connection,
 	// because some servers close the original connection after returning the "401 Unauthorized".
-	//// brconn:              bufio.NewReaderSize(connt, 256),
 	if res.StatusCode == 401 {
-		c.ResetClient() // forces the opening of a new connection for the resent command
-		var dataConn *ConnWithTimeout
-		if dataConn, err = c.OpenConnection(); err != nil {
-			return
-		}
+		// forces the opening of a new connection for the resent command
+		c.ResetClient()
 
-		// new connection
-		c.dataConn = dataConn
-		c.brconn = bufio.NewReaderSize(dataConn, 256)
+		if newDataConn, err := c.OpenConnection(); err == nil {
+			c.dataConn = newDataConn
+			c.brconn = bufio.NewReaderSize(newDataConn, 256)
+		}
 
 		return
 	}
@@ -1432,10 +1429,11 @@ func Handler(h *avutil.RegisterHandler) {
 
 		// Check if the URL Scheme is valid
 		if URL.Scheme != "rtsp" && URL.Scheme != "rtsp+http" {
+			log.Println("Invalid protocol")
 			return
 		}
 
-		// Extract the tunnelPort from query parameters
+		// Extract the optionParam from query parameters
 		opParams := parseOptionParam(URL)
 		if opParams.tunnelPort == 0 && URL.Scheme == "rtsp+http" {
 			opParams.tunnelPort = getPort(URL, 80)
