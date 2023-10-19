@@ -510,7 +510,7 @@ func (c *Client) handleResp(res *Response) (err error) {
 		if len(fields) > 1 {
 			fields := strings.Split(fields[1], "=") //timeout=60
 			if len(fields) > 1 {
-				if timeout, e := strconv.Atoi(fields[1]); e == nil {
+				if timeout, e := strconv.Atoi(fields[1]); e == nil && timeout > 0 {
 					c.RtpTimeout = time.Duration(timeout) * time.Second
 					c.RtpKeepAliveTimeout = time.Duration(int((timeout*70)/100)) * time.Second
 				}
@@ -556,6 +556,9 @@ func (c *Client) handle302(res *Response) (err error) {
 	return err
 }
 
+/**
+* https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/WWW-Authenticate
+ */
 func (c *Client) handle401(res *Response) (err error) {
 	/*
 		RTSP/1.0 401 Unauthorized
